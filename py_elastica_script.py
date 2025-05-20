@@ -1,7 +1,5 @@
 import numpy as np
 from matplotlib import pyplot as plt
-from smt.surrogate_models import KRG, RBF, KPLSK
-from smt.sampling_methods import LHS
 import elastica as ea
 from elastica.modules import (
     BaseSystemCollection,
@@ -20,25 +18,42 @@ from elastica.callback_functions import CallBackBaseClass
 from elastica.timestepper.symplectic_steppers import PositionVerlet
 from elastica.timestepper import integrate
 from elastica.external_forces import NoForces
-from joblib import Parallel, delayed
-from pyslsqp import optimize
-from pyslsqp.postprocessing import print_dict_as_table
-import glob, os
+from elastica._linalg import _batch_norm
+from wrist_kinematics import AsymmetricWristKinematics
+from surrogate_model import MySurrogateModel
+from optimization import MyOptimization
 #from Animation.BeamAnimator import BeamAnimator
 
 class ElasticaForceEstimation:
-    def __init__(self, x, y, z, radii, youngs_modulus, poisson_ratio):
+    def __init__(self, x, y, z, n_rods, radii, youngs_modulus, poisson_ratio):
         self.x = x
         self.y = y
         self.z = z
+        self.n_rods = n_rods
         self.nodes =  np.column_stack([self.x, self.y, self.z])
-        self.n_elem = 3 # numebr of elements that make up each rod
-        self.n_nodes = self.nodes.shape[0]
-        self.directions = (self.nodes[1:] - self.nodes[:-1]) / np.linalg.norm(self.nodes[1:] - self.nodes[:-1], axis=1)[:, None] # Compute unit direction vectors between consecutive nodes
-        ref = np.array([0, 0, -1])
-        self.normals = np.cross(self.directions, ref)
-        diffs = self.nodes[1:] - self.nodes[:-1]             # Shape (n-1, 3)
-        self.lengths = np.linalg.norm(diffs, axis=1)         # Shape (n-1,)
+        if (len(self.nodes)-1) % self.n_rods == 0:
+            self.n_elem = int(len(self.nodes)/self.n_rods) # numebr of elements that make up each rod
+            self.major_nodes = self.nodes[::self.n_elem]
+        else:
+            raise ValueError("# of rods must divide equally into total number of nodes-1 !")
+        
+        # Force all shared nodes to lie on a straight line
+        for i in range(1, self.n_rods):
+            # Index of the shared node between rod i-1 and rod i
+            shared_node_idx = i * self.n_elem
+
+            # Get previous and next node for interpolation
+            prev_node = self.nodes[shared_node_idx - 1]
+            next_node = self.nodes[shared_node_idx + 1]
+
+            # Set the shared node to be the midpoint to enforce straight line
+            self.nodes[shared_node_idx] = (prev_node + next_node) / 2
+        
+        major_tangents = self.major_nodes[1:] - self.major_nodes[:-1]
+        self.directions = major_tangents /np.linalg.norm(major_tangents, axis=1, keepdims=True)
+        self.ref = np.array([0, 0, -1])
+        self.normals = np.cross(self.directions, self.ref)
+        self.lengths = np.linalg.norm(major_tangents, axis=1)         # Shape (n-1,)
         self.total_length = np.sum(self.lengths)
         self.radii = radii
         self.areas = np.pi*self.radii**2
@@ -47,22 +62,23 @@ class ElasticaForceEstimation:
         self.youngs_modulus = youngs_modulus
         self.poisson_ratio = poisson_ratio # 0.36
         self.shear_modulus = self.youngs_modulus / (2 * (1 + poisson_ratio))
-        self.dx = self.total_length / self.n_nodes # Length of each rod segment (spatial resolution)
+        self.dx = self.total_length / len(self.nodes) # Length of each rod segment (spatial resolution)
         self.dt = 2e-6 # should be very low like 1e-6 or you get instability
         self.timestepper = PositionVerlet() # Define time stepper
         self.final_time = 0.15 # time you want simualtion to cover
         self.total_steps = int(self.final_time / self.dt)
-        self.rods = np.empty(self.n_nodes-1, dtype=object)
+        self.rods = np.empty(self.n_rods, dtype=object)
         self.rod_history = {} # Create an array to store a dictionary for each rod
         self.applied_force_index = None # By default
-        for i in range(len(self.rods)):
+        # Create rod history
+        for i in range(self.n_rods):
             self.rod_history[i] = ea.defaultdict(list)
         # Options
         self.PLOT_FIGURE = True
 
     def run(self):
         self.sim = SystemSimulator() # Create new simulation each time
-        for i in range(len(self.rods)):
+        for i in range(self.n_rods):
             rod = self.createRod(i)
             self.addConstraints(rod)
             self.addDamping(rod)
@@ -76,21 +92,52 @@ class ElasticaForceEstimation:
             self.plotFig()
             
     def createRod(self, i):
+        position = self.compute_position(i)
+        directors = self.compute_directors(i, position)
         rod = CosseratRod.straight_rod(
             n_elements=self.n_elem, # number of elements
-            start=self.nodes[i], # Starting position of first node in rod
+            start=self.major_nodes[i], # Starting position of first node in rod
             direction=self.directions[i], # Direction the rod extends
             normal=self.normals[i], # normal vector of rod
             base_length=self.lengths[i], # original length of rod (m)
             base_radius=self.radii[i], # original radius of rod (m)
             density=self.density, # density of rod (kg/m^3)
             youngs_modulus = self.youngs_modulus, # Elastic Modulus (Pa)
-            shear_modulus = self.shear_modulus # Shear Modulus (Pa)
+            shear_modulus = self.shear_modulus, # Shear Modulus (Pa)
+            position=position,
+            directors=directors
         )
+        rod.rest_kappa[:] = rod.kappa[:]
+        rod.rest_sigma[:] = rod.sigma[:]
         self.sim.append(rod)
         self.rods[i] = rod
         return rod
+    
+    def compute_position(self, i):
+        start = i*self.n_elem
+        end = start + self.n_elem+1
+        position = np.zeros((3, self.n_elem+1))
+        position[0, :] = self.nodes[start:end, 0] # all x
+        position[1, :] = self.nodes[start:end, 1] # all y
+        position[2, :] = self.nodes[start:end, 2] # all z
+        return position
 
+    def compute_directors(self, i, position):
+        tangents = position[:,1:] - position[:,:-1]
+        tangents /= _batch_norm(tangents)
+        d3 = tangents
+        d2 = np.zeros((3, self.n_elem))
+        d1 = np.zeros((3, self.n_elem))
+        for i in range(0,self.n_elem):
+            d2[:,i] = self.ref
+            d1[:,i] = np.cross(d2[:,i], d3[:,i])
+        # Putting all direction in the director matrix
+        directors = np.zeros((3,3,self.n_elem))
+        directors[0] = d1
+        directors[1] = d2
+        directors[2] = d3
+        return directors
+    
     def addConstraints(self, rod):
         index = np.where(self.rods == rod)[0][0]
         if index == 0:
@@ -115,7 +162,7 @@ class ElasticaForceEstimation:
     def addForce(self, rod):
         # Add tip force
         index = np.where(self.rods == rod)[0][0]
-        cumsum = np.cumsum(self.lengths)
+        cumsum = np.round(np.cumsum(self.lengths), 4)
         # Find first index where cumulative sum exceeds n
         first_indices = np.where(cumsum >= self.s)[0]
         if len(first_indices) == 0:
@@ -143,9 +190,9 @@ class ElasticaForceEstimation:
 )
     
     def getPosValues(self, time_index):
-        x = np.zeros(self.n_nodes)
-        y = np.zeros(self.n_nodes)
-        z = np.zeros(self.n_nodes)
+        x = np.zeros(len(self.major_nodes))
+        y = np.zeros(len(self.major_nodes))
+        z = np.zeros(len(self.major_nodes))
         for i in range(len(self.rods)):
             history = self.rod_history[i]
             x[i] = history["position"][time_index][0][0]
@@ -157,10 +204,13 @@ class ElasticaForceEstimation:
                 z[i+1] = history["position"][time_index][2][-1]
         return x, y, z
     
-    def getProximalValues(self, F, s, model=None):
+    def getProximalValues(self, F, s, tendon_displacement=None, wrist_model=None, surrogate_model=None):
+        if tendon_displacement != None and wrist_model != None:
+            x_new, y_new = wrist_model.shape(tendon_displacement)
+            self.__init__(x=x_new, y=y_new, z=self.z, n_rods=self.n_rods, radii=self.radii, youngs_modulus=self.youngs_modulus, poisson_ratio=self.poisson_ratio)  # reinitializes the object
         self.F = F
         self.s = s
-        if model == None:
+        if surrogate_model == None:
             # Run simulation
             self.run()
             # Obtain axial force
@@ -169,17 +219,17 @@ class ElasticaForceEstimation:
             axial_force = np.dot(f0, t0) # Scalar: component of force along the tangent 
             # Obtain torques
             torque_global = self.rods[0].internal_torques[:, 0]  # Get global torque vector at node 0 shape: (3,)
-            My = torque_global[1] # Project global torque vector onto local y and z axes
-            Mz = torque_global[0]
+            My = torque_global[0] # Project global torque vector onto local y and z axes
+            Mz = torque_global[1] 
             bending_moment_mag = np.sqrt(My**2 + Mz**2) # Compute the bending moment magnitude (orthogonal to rod axis)
-        elif model != None:
-            x = np.array([[F, s]])
-            axial_force, bending_moment_mag = model.predict(x)[0]
+        elif surrogate_model != None:
+            x = np.array([[F, s, tendon_displacement]])
+            axial_force, bending_moment_mag = surrogate_model.predict(x)[0]
         return axial_force, bending_moment_mag
     
-    def get_distal_values(self, Fx, MB, optimizer):
-        x0 = np.array([0.2, self.total_length/2])
-        optimizer.solve(Fx, MB, x0)
+    def get_distal_values(self, axial_force, bending_moment_mag, tendon_displacement, surrogate_model, optimizer):
+        x0 = np.array([0.3, self.total_length/4])
+        optimizer.solve(axial_force, bending_moment_mag, tendon_displacement, x0, self, surrogate_model)
 
     def plotFig(self):
         x_initial, y_initial, z_initial = self.getPosValues(0)
@@ -287,87 +337,19 @@ class MyCallBack(CallBackBaseClass):
             self.callback_params["applied_force"].append(tip_force_vec.copy())
             return
 
-class MySurrogateModel:
-    def __init__(self, method, elasticaInstance):
-            self.ea = elasticaInstance
-            # Initialize the RBF model
-            if method == "RBF":
-                self.model = RBF(d0=2, poly_degree=1, reg=1e-25)
-            elif method == "KRG":
-                self.model = KRG()
-            elif method == "KPLSK":
-                self.model = KPLSK(
-                    n_comp=8,  # Improves speed & generalization
-                    nugget=1e-4,
-                    theta0=[1e-1],  # Better than 0.01
-                    hyper_opt="Cobyla",  # Faster and more stable for high-D problems
-                )
-            else:
-                 raise ValueError("Invalid surrogate model type!")
-            
-    def get_training_data(self, F_limits, s_limits, n_samples):
-        limits = np.array([[F_limits[0], F_limits[-1]], [s_limits[0], s_limits[-1]]]) 
-        sampling = LHS(xlimits=limits, criterion='maximin')
-        samples = sampling(n_samples)  # Generate initial training points
-        F_samples = np.array(samples[:, 0]) # get all sampeld F's
-        s_samples = np.array(samples[:, 1]) # get all sampeld s's
-        x_train = np.stack((F_samples, s_samples), axis=1)
-        y_train = Parallel(n_jobs=-1)(
-            delayed(self.ea.getProximalValues)(F, s) for F, s in x_train
-        )
-        # Save the scaled training and test sets as .npy
-        os.makedirs("distal_to_proximal_training_data", exist_ok=True)
-        np.save("distal_to_proximal_training_data/x_train.npy", x_train)
-        np.save("distal_to_proximal_training_data/y_train.npy", y_train)
-        raise ValueError("Sampling calculations complete! Please re-run code")
-    
-    def train_model(self):
-        # Load training data
-        x_train = np.load("distal_to_proximal_training_data/x_train.npy")
-        y_train = np.load("distal_to_proximal_training_data/y_train.npy")
-        # Train the model
-        self.model.set_training_values(x_train, y_train)
-        self.model.train()
-        # Predict on the test set
-        y_train_pred, y_train_std = self.model.predict_values(x_train), self.model.predict_variances(x_train)
-        train_error = np.linalg.norm(y_train - y_train_pred) / np.linalg.norm(y_train)
-        print("\ntrain error:", train_error)
-    
-    def predict(self, x):
-        prediction = self.model.predict_values(x)
-        return prediction
-
-class MyOptimization:
-    def __init__(self, elasticaInstance=None, model=None):
-        self.ea = elasticaInstance
-        self.model = model
-
-    def objective(self, x):
-        # the objective function
-        F, s = x
-        Fx_sim, MB_sim = self.ea.getProximalValues(F, s, self.model)
-        obj = (Fx_sim - self.Fx_target)**2 + (MB_sim - self.MB_target)**2 
-        return obj
-
-    def solve(self, Fx, MB, x0):
-        self.Fx_target = Fx
-        self.MB_target = MB
-        self.x0 = x0
-        # optimize returns a dictionary that contains the results from optimization
-        results = optimize(x0, obj=self.objective, acc=1e-6, finite_diff_abs_step=0.01)
-        print_dict_as_table(results)
-
 if __name__ == "__main__":
-    ela = ElasticaForceEstimation(np.linspace(0, 0.2, 21), np.zeros(21), np.zeros(21), np.full(21, 1.5e-3), 2.12e9, 0.35)
-    sur = MySurrogateModel("KRG", ela)
-    #sur.train_model()
-    fx, mb = ela.getProximalValues(0.55, 0.16)
-    print(fx)
-    print(mb)
-    #fx, mb = ela.getProximalValues(0.2, 0.2)
+    wrist = AsymmetricWristKinematics()
+    sur = MySurrogateModel("KRG")
+    ela = ElasticaForceEstimation(x=np.linspace(0,0.2,61), y=np.zeros(61), z=np.zeros(61), n_rods=20, radii=np.full(20, 1.5e-3), youngs_modulus=2.12e9, poisson_ratio=0.35)
+    opt = MyOptimization()
+    #sur.get_training_data(F_limits=np.array([0.1, 0.4]), s_limits=np.array([0.05, 0.2]), tendon_displacement_limits=np.array([0, 0.005]), n_training_samples=300, elastica_model=ela, wrist_model=wrist)
+    #x, y = wrist.shape(0.0027)
+    #fx, mb = ela.getProximalValues(F=0.38, s=0.16, tendon_displacement=0.0027, wrist_model=wrist)
     #print(fx)
     #print(mb)
-    #opt = MyOptimization(ela, sur)
-    #ela.get_distal_values(fx, mb, opt)
+    #print(dl)
+    sur.train_model()
+    #ela.get_distal_values(fx, mb, 0.0027, sur, opt)
 
+   
 
